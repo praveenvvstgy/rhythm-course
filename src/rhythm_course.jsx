@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Play, Pause, RotateCcw, ChevronLeft, ChevronRight, Music, Menu, X } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { Play, Pause, RotateCcw, ChevronLeft, ChevronRight, Menu, X } from "lucide-react";
 
 // ============================================================================
 // AUDIO ENGINE
@@ -48,7 +48,7 @@ function useAudio() {
         gain.gain.setValueAtTime(gain.gain.value, t);
         gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.02);
         osc.stop(t + 0.03);
-      } catch (e) {
+      } catch {
         // osc may already have stopped — ignore.
       }
     }
@@ -132,67 +132,95 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
   // frame from the audio clock. This makes the playhead glide smoothly with
   // the audio instead of stepping in discrete chunks.
   const [position, setPosition] = useState(0);
+  // Anchor-based timing lets us change tempo mid-play without skipping or
+  // jumping the playhead. anchor: { audioTime, subIdx } is the fixed point;
+  // current position = anchor.subIdx + (now - anchor.audioTime) / currentSubDur.
+  // When tempo changes, we re-anchor at "now" so existing position is preserved.
   const stateRef = useRef({
-    startTime: 0,        // audioCtx time when subdivision 0 sounds
-    schedAhead: 0,       // index of next subdivision to schedule
+    anchorTime: 0,       // audioCtx time of anchor
+    anchorSub: 0,        // subdivision index at anchor
+    nextSched: 0,        // index of next subdivision to schedule
+    nextSchedTime: 0,    // audio time when nextSched should fire
     running: false,
   });
   const rafRef = useRef(null);
+  // Hold the latest tick callback and timing params in refs so the running
+  // loop reads the live values (no stale closures, no ref-during-render).
   const onTickRef = useRef(onTick);
-  onTickRef.current = onTick;
+  const bpmRef = useRef(bpm);
+  const subdivisionRef = useRef(subdivision);
+  const totalSubsRef = useRef(totalSubdivisions);
+
+  useEffect(() => { onTickRef.current = onTick; }, [onTick]);
+  useEffect(() => { subdivisionRef.current = subdivision; }, [subdivision]);
+  useEffect(() => { totalSubsRef.current = totalSubdivisions; }, [totalSubdivisions]);
+
+  // When BPM changes mid-play, re-anchor so position progresses smoothly with the new tempo.
+  useEffect(() => {
+    const oldBpm = bpmRef.current;
+    bpmRef.current = bpm;
+    const s = stateRef.current;
+    if (!s.running || oldBpm === bpm) return;
+    const t = audio.now();
+    const oldSubDur = 60 / oldBpm / subdivisionRef.current;
+    const elapsed = Math.max(0, t - s.anchorTime);
+    const currentSub = s.anchorSub + elapsed / oldSubDur;
+    s.anchorTime = t;
+    s.anchorSub = currentSub;
+    // Recompute when the next un-scheduled subdivision should fire under the new tempo.
+    const newSubDur = 60 / bpm / subdivisionRef.current;
+    s.nextSchedTime = t + (s.nextSched - currentSub) * newSubDur;
+  }, [bpm, audio]);
 
   const stop = useCallback(() => {
     stateRef.current.running = false;
     setPlaying(false);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    // Kill any audio that was scheduled but hasn't played yet.
     audio.cancelScheduled();
   }, [audio]);
 
   const reset = useCallback(() => {
     stop();
     setPosition(0);
-    stateRef.current.schedAhead = 0;
+    stateRef.current.anchorSub = 0;
+    stateRef.current.nextSched = 0;
   }, [stop]);
 
   const start = useCallback(() => {
     audio.ensureCtx();
-    const subDur = 60 / bpm / subdivision; // seconds per subdivision
-    const lookAhead = 0.12;                // schedule this far ahead
-    const startTime = audio.now() + 0.08;  // small lead-in so first note isn't clipped
-
-    stateRef.current.startTime = startTime;
-    stateRef.current.schedAhead = 0;
-    stateRef.current.running = true;
+    const lookAhead = 0.12;
+    const startTime = audio.now() + 0.08;
+    const s = stateRef.current;
+    s.anchorTime = startTime;
+    s.anchorSub = 0;
+    s.nextSched = 0;
+    s.nextSchedTime = startTime;
+    s.running = true;
     setPosition(0);
     setPlaying(true);
 
     const loop = () => {
       if (!stateRef.current.running) return;
       const t = audio.now();
+      const subDur = 60 / bpmRef.current / subdivisionRef.current;
+      const totalSubs = totalSubsRef.current;
 
       // 1. Schedule any subdivisions whose time falls within the lookahead window.
       while (
-        stateRef.current.schedAhead < totalSubdivisions &&
-        startTime + stateRef.current.schedAhead * subDur < t + lookAhead
+        s.nextSched < totalSubs &&
+        s.nextSchedTime < t + lookAhead
       ) {
-        const idx = stateRef.current.schedAhead;
-        const when = startTime + idx * subDur;
-        if (onTickRef.current) onTickRef.current(idx, when, audio);
-        stateRef.current.schedAhead += 1;
+        if (onTickRef.current) onTickRef.current(s.nextSched, s.nextSchedTime, audio);
+        s.nextSched += 1;
+        s.nextSchedTime += subDur;
       }
 
-      // 2. Update the visual position from the audio clock — this is the
-      // *continuous* progress through the piece, in subdivisions.
-      const elapsed = t - startTime;
-      const continuousPos = Math.max(0, elapsed / subDur);
+      // 2. Update the visual position from the audio clock.
+      const elapsed = Math.max(0, t - s.anchorTime);
+      const continuousPos = s.anchorSub + elapsed / subDur;
 
-      if (totalSubdivisions !== Infinity && continuousPos >= totalSubdivisions) {
-        // We've reached (or passed) the end. Pin the position to the final
-        // subdivision and let any tail audio finish before clearing the play
-        // state. We add a small grace period so the last note's release isn't
-        // chopped visually.
-        setPosition(totalSubdivisions);
+      if (totalSubs !== Infinity && continuousPos >= totalSubs) {
+        setPosition(totalSubs);
         const tailMs = 250;
         setTimeout(() => {
           if (stateRef.current.running) {
@@ -207,7 +235,7 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-  }, [audio, bpm, subdivision, totalSubdivisions]);
+  }, [audio]);
 
   useEffect(() => () => stop(), [stop]);
 
@@ -278,8 +306,32 @@ function AugmentationDot({ x, y, unit = 10 }) {
   return <circle cx={x + unit * 1.2} cy={y} r={unit * 0.22} fill="currentColor" />;
 }
 
+// Ledger lines for notes that sit above or below the 5-line staff.
+// `staffY` is the middle-line Y. The staff spans from staffY-2u (top line)
+// to staffY+2u (bottom line). We add short horizontal lines every `unit`
+// past those boundaries, on whole-step positions only.
+function LedgerLines({ x, y, staffY, unit = 10 }) {
+  const lines = [];
+  const halfWidth = unit * 1.0;
+  // Below the staff: positions staffY+3u, staffY+4u, ...
+  if (y > staffY + unit * 2) {
+    for (let ly = staffY + unit * 3; ly <= y + unit * 0.4; ly += unit) {
+      lines.push(<line key={`b${ly}`} x1={x - halfWidth} x2={x + halfWidth} y1={ly} y2={ly} stroke="currentColor" strokeWidth={unit * 0.16} />);
+    }
+  }
+  // Above the staff: positions staffY-3u, staffY-4u, ...
+  if (y < staffY - unit * 2) {
+    for (let ly = staffY - unit * 3; ly >= y - unit * 0.4; ly -= unit) {
+      lines.push(<line key={`a${ly}`} x1={x - halfWidth} x2={x + halfWidth} y1={ly} y2={ly} stroke="currentColor" strokeWidth={unit * 0.16} />);
+    }
+  }
+  return <g>{lines}</g>;
+}
+
 // A complete note. Type: 'whole', 'half', 'quarter', 'eighth', 'sixteenth'.
-function Note({ x, y, type = "quarter", dotted = false, stemUp = true, staccato = false, unit = 10, label = null }) {
+// Pass `staffY` (middle-line y) to draw ledger lines automatically when the
+// note sits outside the 5-line staff.
+function Note({ x, y, type = "quarter", dotted = false, stemUp = true, staccato = false, unit = 10, label = null, staffY = null }) {
   const filled = type !== "whole" && type !== "half";
   const hasStem = type !== "whole";
   const flagCount = type === "eighth" ? 1 : type === "sixteenth" ? 2 : 0;
@@ -287,6 +339,7 @@ function Note({ x, y, type = "quarter", dotted = false, stemUp = true, staccato 
 
   return (
     <g>
+      {staffY !== null && <LedgerLines x={x} y={y} staffY={staffY} unit={unit} />}
       <Notehead x={x} y={y} filled={filled} unit={unit} />
       {hasStem && <Stem x={x} y={y} up={stemUp} unit={unit} length={stemLen} />}
       {flagCount > 0 && <Flag x={x} y={y} up={stemUp} unit={unit} count={flagCount} stemLen={stemLen} />}
@@ -452,18 +505,80 @@ function Insight({ children }) {
 }
 
 // ============================================================================
-// LESSON COMPONENTS START HERE — defined further below
+// YOUTUBE EMBED
+// Lazy-loaded: shows a thumbnail until clicked, then swaps in the iframe with
+// autoplay. Saves bandwidth and avoids loading dozens of YouTube players up
+// front (this course references ~25 videos).
 // ============================================================================
 
-// Placeholder so we can stub out lessons we haven't built yet.
-function ComingSoon({ title }) {
+function YouTubeEmbed({ id, title = "", caption = "", start = 0 }) {
+  const [loaded, setLoaded] = useState(false);
+  const src = `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0${start ? `&start=${start}` : ""}`;
+  const thumb = `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
   return (
-    <div className="p-12 text-center text-stone-500">
-      <Music className="mx-auto mb-4 opacity-50" size={48} />
-      <p className="italic">Animation for "{title}" — being constructed</p>
+    <figure className="my-4">
+      <div className="relative w-full bg-stone-900 overflow-hidden border border-stone-900" style={{ aspectRatio: "16 / 9", borderRadius: "2px" }}>
+        {loaded ? (
+          <iframe
+            src={src}
+            title={title || "YouTube video"}
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            className="absolute inset-0 w-full h-full"
+            style={{ border: 0 }}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setLoaded(true)}
+            className="absolute inset-0 w-full h-full group"
+            aria-label={`Play video: ${title || id}`}
+          >
+            <img
+              src={thumb}
+              alt={title || "YouTube video thumbnail"}
+              loading="lazy"
+              className="absolute inset-0 w-full h-full object-cover opacity-90 group-hover:opacity-100 transition"
+            />
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="bg-red-700 text-amber-50 rounded-full w-16 h-16 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+                <Play size={28} fill="currentColor" className="ml-1" />
+              </div>
+            </div>
+            {title && (
+              <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-stone-900/80 to-transparent text-amber-50 text-sm p-3 text-left">
+                {title}
+              </div>
+            )}
+          </button>
+        )}
+      </div>
+      {caption && <figcaption className="text-sm text-stone-600 italic mt-2 leading-relaxed">{caption}</figcaption>}
+    </figure>
+  );
+}
+
+// A grid of video clips — used for "listen" sections that present several
+// example tracks side-by-side.
+function VideoGrid({ videos }) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 my-4">
+      {videos.map((v) => (
+        <YouTubeEmbed key={v.id} id={v.id} title={v.title} caption={v.caption} start={v.start} />
+      ))}
     </div>
   );
 }
+
+// Simple localStorage wrapper that swallows errors (e.g. private browsing).
+const storage = {
+  get(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, String(value)); } catch { /* ignore */ }
+  },
+};
 
 // ============================================================================
 // MAIN APP
@@ -484,24 +599,21 @@ const LESSONS = [
   { id: 12, title: "Time signatures", subtitle: "3/4 vs 6/8 — and why it matters" },
 ];
 
+// Read the persisted current lesson once during initial render so we never
+// call setState inside an effect (which causes a cascading render).
+function loadCurrentLesson() {
+  const saved = storage.get("rhythm_course_current");
+  if (!saved) return 1;
+  const n = Number(saved);
+  return Number.isFinite(n) && n >= 1 && n <= 12 ? n : 1;
+}
+
 export default function RhythmCourse() {
-  const [current, setCurrent] = useState(1);
+  const [current, setCurrent] = useState(loadCurrentLesson);
   const [navOpen, setNavOpen] = useState(false);
 
-  // Persist current lesson
   useEffect(() => {
-    (async () => {
-      try {
-        const r = await window.storage?.get("rhythm_course_current");
-        if (r?.value) setCurrent(Number(r.value));
-      } catch {}
-    })();
-  }, []);
-
-  useEffect(() => {
-    (async () => {
-      try { await window.storage?.set("rhythm_course_current", String(current)); } catch {}
-    })();
+    storage.set("rhythm_course_current", current);
   }, [current]);
 
   const lesson = LESSONS.find((l) => l.id === current);
@@ -662,15 +774,56 @@ function Lesson1() {
 
   return (
     <div className="space-y-6">
+      <details className="border border-stone-300 bg-amber-50/60 p-4 text-sm leading-relaxed text-stone-700" style={{ borderRadius: "2px" }}>
+        <summary className="cursor-pointer font-medium text-stone-900">
+          A note from Benedict, before we begin
+        </summary>
+        <div className="mt-3 space-y-3">
+          <p>
+            This is the third part of <em>Read Music Fast!</em> — a 12-part series on reading
+            rhythm. Rhythm comes <em>after</em> notes and key signatures because, honestly, you can
+            usually copy a rhythm off a recording faster than you can work out the notes. Not being
+            able to read rhythm certainly didn't hamper musicians like Art Tatum or Stevie Wonder
+            (who couldn't see), or Jimi Hendrix and Paul McCartney (who couldn't read). But if
+            you're playing on your own, it helps to be able to analyse a rhythm so you can play it
+            properly.
+          </p>
+          <p className="italic">
+            Rhythm notation is even more counter-intuitive than note notation, which is saying a
+            lot. We'll make it as straightforward as possible.
+          </p>
+        </div>
+        <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <YouTubeEmbed id="D9Cs_zb4q14" title="Art Tatum" />
+          <YouTubeEmbed id="9_k7D92Ir4k" title="Stevie Wonder" />
+          <YouTubeEmbed id="IPtv14q9ZDg" title="Jimi Hendrix" />
+          <YouTubeEmbed id="A_MjCqQoLLA" title="Paul McCartney" />
+        </div>
+      </details>
+
       <p className="text-lg leading-relaxed">
-        A <strong>beat</strong> is a regularly-occurring point in time — what your foot taps to.
-        Beats are grouped into <strong>bars</strong>, and the first beat of each bar gets emphasis.
+        Before we get into notation, let's pin down the basics. A <strong>beat</strong> is what your
+        foot taps to when you listen to a piece of music. The snare in Stevie Wonder's "Uptight" or
+        the bass drum in Daft Punk's "One More Time" both fall <em>on the beat</em>.
+      </p>
+
+      <VideoGrid videos={[
+        { id: "8pBym6iHlBk", title: "Stevie Wonder — \"Uptight\"", caption: "The snare drum lands on the beat (≈133 bpm)." },
+        { id: "A2VpR8HahKc", title: "Daft Punk — \"One More Time\"", caption: "The bass drum lands on the beat (≈123 bpm)." },
+      ]} />
+
+      <p className="leading-relaxed">
+        From those two examples we can write a definition: <strong>a beat is a regularly-occurring
+        point in time</strong>. Two things follow from that. <em>Regularly-occurring</em> means the
+        spacing between beats is steady, no matter what other rhythms are happening. <em>A point in
+        time</em> means beats themselves don't have length — the snare or bass drum isn't <em>the</em>{" "}
+        beat, it's <em>on</em> the beat. The beat is a concept.
       </p>
 
       <Insight>
-        Press play. Listen for the <em>brighter</em> click on beat 1 of each bar. Try changing the
-        tempo (BPM) and the number of beats per bar. Notice how only the speed changes — the
-        beats stay perfectly even.
+        Press play below. Listen for the <em>brighter</em> click on beat 1 of each bar. Drag the
+        BPM and beats-per-bar sliders. Only the speed and grouping change — the beats stay
+        perfectly even.
       </Insight>
 
       <div className="border border-stone-900 bg-amber-50 p-6" style={{ borderRadius: "2px" }}>
@@ -716,10 +869,27 @@ function Lesson1() {
         </div>
 
         <div className="space-y-3">
-          <Slider label="BPM" value={bpm} onChange={(v) => { t.stop(); setBpm(v); }} min={40} max={200} suffix=" bpm" />
+          <Slider label="BPM" value={bpm} onChange={setBpm} min={40} max={200} suffix=" bpm" />
           <Slider label="Beats / bar" value={beatsPerBar} onChange={(v) => { t.stop(); setBeatsPerBar(v); }} min={2} max={6} />
         </div>
       </div>
+
+      <h3 className="display-font text-2xl font-black mt-8">BPM — beats per minute</h3>
+      <p className="leading-relaxed">
+        How <em>regularly</em> regular? That depends. We measure how far apart beats are with{" "}
+        <strong>BPM</strong> — beats per minute. 60 bpm is one beat per second; 120 bpm is two per
+        second. The speed of a piece is its <em>tempo</em> (Italian for "time").
+      </p>
+
+      <VideoGrid videos={[
+        { id: "y6KWK7DPPjE", title: "Yuja Wang — Strauss \"Tritsch-Tratsch-Polka\"", caption: "Around 180 bpm — fast." },
+        { id: "_eLU5W1vc8Y", title: "Albinoni — \"Adagio\"", caption: "Around 60 bpm — about a third of the speed of the Strauss." },
+      ]} />
+
+      <p className="leading-relaxed text-sm text-stone-700">
+        For reference: Stevie Wonder's "Uptight" sits at about 133 bpm, Daft Punk's "One More Time"
+        at 123 bpm. Dance music often sits around 120 — the rate of a slightly elevated heartbeat.
+      </p>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
         {[
@@ -740,9 +910,54 @@ function Lesson1() {
         ))}
       </div>
 
+      <Insight>
+        <strong>Important:</strong> don't confuse <em>how far apart the beats are</em> with{" "}
+        <em>how far apart the notes are</em>. A quieter passage of "One More Time" might{" "}
+        <em>feel</em> slower, but the beat itself is identical — your foot would tap at the same
+        speed.
+      </Insight>
+
+      <h3 className="display-font text-2xl font-black mt-8">Bars: counting beats in groups</h3>
+      <p className="leading-relaxed">
+        We don't count beats one at a time, or in a never-ending list. We count beats in repeated
+        groups — like Coolio:
+      </p>
+
+      <YouTubeEmbed
+        id="E2KRH27aWcU"
+        title={`Coolio — "1, 2, 3, 4 (Sumpin' New)"`}
+        caption="Most popular music groups beats in fours: 1, 2, 3, 4 / 1, 2, 3, 4 / …"
+      />
+
+      <p className="leading-relaxed">
+        It can be other numbers though. "Oom Pah-Pah" from <em>Oliver!</em> groups beats in{" "}
+        <strong>threes</strong>:
+      </p>
+
+      <YouTubeEmbed
+        id="njx_ojr-Hi4"
+        title='"Oom Pah-Pah" from Oliver!'
+        caption="Three beats per bar: OOM-pah-pah, OOM-pah-pah."
+      />
+
+      <p className="leading-relaxed">
+        A repeated group of beats is called a <strong>bar</strong> (or <em>measure</em>, in the
+        US). The first beat of a bar is emphasised — the "OOM" in "Oom-Pah-Pah" is also lower
+        than the "pah"s. You can hear the same pattern in Verdi's "La donna è mobile": the bass
+        notes fall on beat 1, while the upper chords cover the other beats.
+      </p>
+
+      <YouTubeEmbed
+        id="xCFEk6Y8TmM"
+        title='Verdi — "La donna è mobile"'
+        caption="Bass note on beat 1, chords on beats 2 and 3."
+      />
+
       <Caption>
-        BPM = beats per minute. 60 bpm is one beat per second; 120 bpm is two per second.
-        Pop and dance music typically sits around 120 (the rate of a slightly elevated heartbeat).
+        <strong>How beats are notated in scores:</strong> they aren't, directly. Bar lines (the
+        vertical lines between groups of notes) are the only visible cue, and you have to work out
+        where each beat falls from the durations of the notes themselves. We'll do exactly that
+        in part 3, with Beethoven's <em>Ode to Joy</em>.
       </Caption>
     </div>
   );
@@ -782,14 +997,28 @@ function Lesson2() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        Notes have <strong>duration</strong>. As a note's symbol gets "heavier" — a stem is added,
-        the head fills in, a flag appears — its duration is cut in half.
+        Unlike beats, which are points in time, <strong>notes have duration</strong>. They can
+        start at any time and be any length. The last note of Stravinsky's <em>Firebird</em> lasts
+        about 6 seconds; the notes in Rimsky-Korsakov's "Flight of the Bumblebee" are a fraction of
+        a second each.
+      </p>
+
+      <VideoGrid videos={[
+        { id: "5tGA6bpscj8", title: "Stravinsky — The Firebird (final note)", caption: "A single note, ~6 seconds long." },
+        { id: "fdKEUmFUMFg", title: "Rimsky-Korsakov — Flight of the Bumblebee", caption: "Notes a fraction of a second each (Yuja Wang plays Cziffra's arrangement)." },
+      ]} />
+
+      <h3 className="display-font text-2xl font-black mt-8">Beats and "beats"</h3>
+      <p className="leading-relaxed">
+        Quick warning. We just defined a beat as a <em>point in time</em>. But the word "beat"
+        is also used for the <em>length of time between</em> two consecutive beats — so we can say
+        a note is "2 beats long" or "1 beat long". Same word, two meanings (point vs. length).
+        Which one is meant is usually obvious from context.
       </p>
 
       <Insight>
-        The four ingredients that make a note "heavier": a <strong>stem</strong>,
-        a <strong>filled head</strong>, a <strong>flag</strong>, and additional flags.
-        Each one halves the duration. Click each note to hear it.
+        As a note's symbol gets "heavier" — adding a stem, filling in the head, adding flags —
+        its duration is cut in half each time. Click each note below to hear it.
       </Insight>
 
       {/* Comparison: staff notation vs. piano-roll bar */}
@@ -944,7 +1173,7 @@ function Lesson3() {
   const t = useTransport({ bpm, subdivision: SUBDIV, totalSubdivisions: totalSubs, onTick });
 
   const currentBeatExact = t.position / SUBDIV;
-  const currentNoteIdx = melody.findIndex((n, i) =>
+  const currentNoteIdx = melody.findIndex((n) =>
     currentBeatExact >= n.position && currentBeatExact < n.position + n.beats
   );
 
@@ -975,7 +1204,9 @@ function Lesson3() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        Three rules let you read any rhythm. Apply them to Beethoven's <em>Ode to Joy</em>.
+        Music notation doesn't draw the beats — you have to deduce them from the notes. Three
+        rules, true for every piece, let you do that. We'll apply them to Beethoven's{" "}
+        <em>Ode to Joy</em>.
       </p>
 
       {showRules && (
@@ -985,12 +1216,29 @@ function Lesson3() {
           </button>
           <p className="font-semibold display-font text-lg mb-2">The three rules</p>
           <ol className="list-decimal pl-5 space-y-1">
-            <li>The first note after a barline is on <strong>beat 1</strong>.</li>
-            <li>A note's <strong>length</strong> tells you when the <em>next</em> note happens.</li>
-            <li>Notes stacked vertically are played at the <strong>same time</strong>.</li>
+            <li>The first note (or rest) after a bar line is always on <strong>beat 1</strong> of the bar.</li>
+            <li>The length of a note (or rest) tells you when the <em>next</em> note (or rest) happens.</li>
+            <li>Notes stacked vertically on the staff are played at the <strong>same time</strong>.</li>
           </ol>
+          <p className="text-sm italic text-stone-700 mt-2">
+            Plus, in this piece the bottom number of the time signature is 4, so a quarter note = 1
+            beat. (We'll cover what that bottom number does in part 12.)
+          </p>
         </div>
       )}
+
+      <YouTubeEmbed
+        id="2nNrjsoJvIg"
+        title="Counting beats in bars — Ode to Joy walkthrough"
+        caption="Benedict walks through Beethoven's tune note-by-note, deducing where each beat falls."
+      />
+
+      <p className="leading-relaxed">
+        Below, you can play the same melody and watch the beat numbers tick under the staff.
+        Notice how the second-to-last bar contains a <em>dotted quarter</em> followed by an{" "}
+        <em>eighth</em> — together they take 1½ + ½ = 2 beats, and the half note that follows
+        fills the remaining 2 beats. Dotted notes are next.
+      </p>
 
       <div className="border border-stone-900 bg-amber-50 p-4 sm:p-6" style={{ borderRadius: "2px" }}>
         <div className="overflow-x-auto pb-2">
@@ -1015,7 +1263,7 @@ function Lesson3() {
               const color = isActive ? "#9a1f1f" : isPast ? "#999" : "#1c1917";
               return (
                 <g key={i} style={{ color }}>
-                  <Note x={x} y={y} type={n.type} dotted={n.dotted} stemUp={stemUp} unit={6} />
+                  <Note x={x} y={y} type={n.type} dotted={n.dotted} stemUp={stemUp} unit={6} staffY={STAFF_Y} />
                 </g>
               );
             })}
@@ -1326,7 +1574,15 @@ function Lesson5() {
       <p className="text-lg leading-relaxed">
         When notes fall <em>between</em> the beats — on what's called the <strong>offbeat</strong> — we
         count them by saying "<strong>and</strong>" (often written as <span className="mono-font">+</span>).
+        For more practice, here's Benedict working through Brahms's Lullaby — same technique, more
+        offbeats:
       </p>
+
+      <YouTubeEmbed
+        id="7-yR5BjTQyc"
+        title="Counting offbeats — Brahms's Lullaby walkthrough"
+        caption="Three beats per bar, with eighth notes filling in the offbeats."
+      />
 
       <Insight>
         The trick: say "<strong>1 and 2 and 3 and 4 and</strong>" steadily, with the numbers landing
@@ -1472,31 +1728,15 @@ function Lesson6() {
 
   const t = useTransport({ bpm, subdivision: 1, totalSubdivisions: Infinity, onTick });
 
-  // Pendulum animation: angle oscillates with bpm.
-  const [angle, setAngle] = useState(-30);
-  const angleRef = useRef(-30);
-  const dirRef = useRef(1);
-  const lastBeatTimeRef = useRef(0);
-
-  useEffect(() => {
-    if (!t.playing) return;
-    let raf;
-    const animate = () => {
-      const period = 60 / bpm; // seconds per beat
-      const now = performance.now() / 1000;
-      // Phase 0..1 within a beat; pendulum swings full L->R per beat.
-      const dt = period;
-      // Use audioContext.currentTime if available for sync — but performance.now is fine here.
-      const phase = (now / period) % 2; // 0..2, two-beat cycle for full swing
-      const a = phase < 1
-        ? -30 + 60 * phase
-        : 30 - 60 * (phase - 1);
-      setAngle(a);
-      raf = requestAnimationFrame(animate);
-    };
-    raf = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(raf);
-  }, [t.playing, bpm]);
+  // Pendulum animation. Synced to the transport's continuous `position` so the
+  // arm reaches its furthest swing exactly when the audio click sounds. Each
+  // beat is half a swing cycle: -30° → +30° → -30° over two beats.
+  const angle = t.playing
+    ? (() => {
+        const phase = t.position % 2; // 0..2 over two beats
+        return phase < 1 ? -30 + 60 * phase : 30 - 60 * (phase - 1);
+      })()
+    : -30;
 
   const STEPS = [
     "Make sure you're on top of the notes and fingering.",
@@ -1513,9 +1753,16 @@ function Lesson6() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        A metronome turns the abstract beat into something audible. Practice <em>with</em> it
-        until in-time playing becomes second nature.
+        Now that we know <em>where</em> the beats go on the page, how do we translate that into
+        actually playing the piece in time? With a <strong>metronome</strong>. It turns the
+        abstract beat into something audible.
       </p>
+
+      <YouTubeEmbed
+        id="3sOAxHfRkTw"
+        title="Playing with a metronome — practice walkthrough"
+        caption="Benedict demonstrates the seven-step protocol. Watch this first, then use the metronome below."
+      />
 
       <Insight>
         The metronome is unforgiving — that's the point. Set it slow enough that you can play
@@ -1684,13 +1931,22 @@ function Lesson7() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        We just learned beats and offbeats. What about <em>quarter</em> the way through a beat?
-        That's a <strong>¼-beat note</strong> (a sixteenth note), and it has its own counting syllable.
+        We covered offbeats in part 5. What about "off-offbeats" — notes that fall halfway between
+        a beat and an offbeat? Those are <strong>¼-beat notes</strong> (sixteenth notes), and they
+        need a different counting technique.
       </p>
 
+      <YouTubeEmbed
+        id="hWD4Osy6oiE"
+        title="Counting ¼-beats — worked examples"
+        caption="A few short examples of how to count sixteenth-note rhythms."
+      />
+
       <Insight>
-        Each beat splits into 4 syllables: <strong>1 — e — and — a</strong>. The number is the beat,
-        the "and" is the offbeat (halfway), and "e" / "a" are the quarter-points before and after.
+        Each beat splits into 4 syllables: <strong>1 — e — and — a</strong>. The number is the
+        beat, the "and" is the offbeat (halfway), and "e" / "a" are the quarter-points before and
+        after. Don't confuse a ¼-<em>beat</em> (a sixteenth — a quarter <em>of</em> a beat) with a{" "}
+        <em>quarter note</em> (one whole beat).
       </Insight>
 
       <div className="border border-stone-900 bg-amber-50 p-4 sm:p-6" style={{ borderRadius: "2px" }}>
@@ -1844,13 +2100,22 @@ function Lesson8() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        A <strong>dotted rhythm</strong> is a dotted-eighth followed by a sixteenth. The most
-        common mistake: playing it like a triplet (the second note too late, beat split in 3).
+        A <strong>dotted rhythm</strong> is a particular use of dotted notes: one note falls on the
+        beat, another falls ¾ of the way through the beat. Written as{" "}
+        <span className="mono-font">𝅘𝅥𝅮. 𝅘𝅥𝅯</span> — a dotted-eighth followed by a sixteenth. It's
+        common enough that it's worth practicing on its own.
       </p>
 
+      <YouTubeEmbed
+        id="qj4Sh3rl6h4"
+        title="Dotted rhythms — worked examples"
+        caption="Benedict works through dotted rhythms in Dvořák's Largo, Albinoni's Adagio, Bizet's Toreador Song, and Verdi's La donna è mobile."
+      />
+
       <Insight>
-        The rule: when playing a dotted rhythm, <strong>split the beat into 4</strong>, not 3.
-        The first note takes ¾ of the beat (3 sixteenths); the second takes ¼ (1 sixteenth).
+        The rule: when playing a dotted rhythm, <strong>split the beat into 4</strong>, not 3. The
+        first note takes ¾ of the beat (3 sixteenths); the second takes ¼ (1 sixteenth). The most
+        common mistake is splitting it into 3 — making it sound like a triplet.
       </Insight>
 
       <div className="border border-stone-900 bg-amber-50 p-6" style={{ borderRadius: "2px" }}>
@@ -2063,8 +2328,15 @@ function Lesson9() {
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
         A <strong>rest</strong> is a symbol that tells you <em>not</em> to play anything for a
-        certain number of beats. Every note duration has a matching rest.
+        certain period of time. A 1-beat rest = silence for 1 beat, a 2-beat rest = silence for 2
+        beats, and so on. Every note duration has a matching rest.
       </p>
+
+      <YouTubeEmbed
+        id="41GwV7KssfI"
+        title="Rests — deducing the symbols from real scores"
+        caption="Just as we deduced the note symbols from Ode to Joy, we can deduce most of the rest symbols from scores."
+      />
 
       <Insight>
         Unlike notes (where heavier = half as long), rest symbols are mostly arbitrary and just
@@ -2206,9 +2478,11 @@ function Lesson9() {
       </div>
 
       <Caption>
-        <strong>Note:</strong> the symbol for a 4-beat rest also serves as a "whole bar rest" —
-        meaning "rest for the entire bar," even if the bar isn't 4 beats long. So a whole-rest
-        in 3/4 means rest for 3 beats; in 6/8, rest for the whole bar.
+        <strong>Important:</strong> the symbol for a 4-beat rest is <em>also</em> the symbol for a
+        bar-long rest, even if the bar isn't 4 beats long. So a whole-rest in 3/4 means rest for 3
+        beats; in 6/8, rest for the whole bar. You'll see this in pieces like Ponchielli's "Dance
+        of the Hours" (3/4) and Saint-Saëns's "The Swan" (6/4) — bars that look like they have a
+        4-beat rest are actually full-bar rests.
       </Caption>
     </div>
   );
@@ -2274,8 +2548,19 @@ function Lesson10() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        A dot <em>above or below</em> a note (not after it!) means <strong>staccato</strong> —
-        Italian for "detached." The note is played short, with silence after it.
+        A dot <em>above or below</em> a note (not <em>after</em> it!) means{" "}
+        <strong>staccato</strong> — Italian for "detached." The note is played short, with silence
+        after it. You can hear it from the very opening of Haydn's "Surprise" Symphony:
+      </p>
+
+      <YouTubeEmbed
+        id="fg9oSHL4J1g"
+        title='Haydn — "Surprise" Symphony, "Andante" (first 18 seconds)'
+        caption="Crisp, detached quarter notes — that's staccato."
+      />
+
+      <p className="leading-relaxed">
+        Why does it sound short like that? Because of the rule below.
       </p>
 
       <Insight>
@@ -2427,11 +2712,38 @@ function Lesson10() {
         </div>
       </div>
 
+      <h3 className="display-font text-2xl font-black mt-8">Two more examples</h3>
+      <p className="leading-relaxed">
+        The same trick is used in Bizet's "Toreador Song" — the left hand is{" "}
+        <em>written</em> as plain quarter notes with staccato dots, but is <em>played</em> as
+        eighth-note + eighth-rest pairs:
+      </p>
+
+      <YouTubeEmbed
+        id="BZly4o23Cqw"
+        title='Bizet — "Toreador Song"'
+        caption="Listen for the bouncy, detached left hand."
+      />
+
+      <p className="leading-relaxed">
+        And one more wrinkle: <em>sometimes a staccato note is even shorter than half its
+        length</em>. In the original orchestral version of Albinoni's Adagio the bass was{" "}
+        <em>pizzicato</em> (plucked strings), so Benedict notates it as staccato quarter notes —
+        but recommends playing them as <strong>1⁄16-notes</strong> (a quarter of their written
+        length) to get the full pizzicato effect:
+      </p>
+
+      <YouTubeEmbed
+        id="0VSKn00faGQ"
+        title="Albinoni — Adagio (with pizzicato bass)"
+        caption="The staccato quarters in the bass are played as 1⁄16-notes — even shorter than the rule says."
+      />
+
       <Caption>
-        Why not just write the actual rests? Because staccato dots are easier to read and write
-        — much less cluttered. Music notation grew up by hand, and economy on the page mattered.
-        <strong> Don't confuse</strong> a staccato dot (above/below the note) with an
-        augmentation dot (after the note, lengthening it).
+        Why not just write the actual rests? Because staccato dots are easier to read and write —
+        much less cluttered. Music notation grew up by hand, and economy on the page mattered.{" "}
+        <strong>Don't confuse</strong> a staccato dot (above/below the note) with an augmentation
+        dot (after the note, lengthening it).
       </Caption>
     </div>
   );
@@ -2491,18 +2803,20 @@ function Lesson11() {
   const t = useTransport({ bpm, subdivision: SUBDIV, totalSubdivisions: totalSubs, onTick });
   const beatExact = t.position / SUBDIV;
 
-  // Count syllables for 32nd notes: each beat = "1 . e . + . a ."
-  // Where the "." is an extra "and" for the 32nd note positions.
+  // Per the Musophone instruction: "count the ¼-beats normally (1 e + a) and
+  // slip an 'and' between each pair." We label the four ¼-beat positions
+  // explicitly and use a small ampersand on the in-between ⅛-beat positions
+  // (so it's visually clear which is which).
   const SYLLABLES_32 = [];
   for (let beat = 1; beat <= 4; beat++) {
     SYLLABLES_32.push({ s: String(beat), main: true });
-    SYLLABLES_32.push({ s: "+", main: false, extra: true });   // 32nd between 1 and "e"
+    SYLLABLES_32.push({ s: "&", main: false, extra: true });   // ⅛-beat between 1 and e
     SYLLABLES_32.push({ s: "e", main: true });
-    SYLLABLES_32.push({ s: "+", main: false, extra: true });   // 32nd between "e" and "+"
+    SYLLABLES_32.push({ s: "&", main: false, extra: true });   // ⅛-beat between e and +
     SYLLABLES_32.push({ s: "+", main: true });
-    SYLLABLES_32.push({ s: "+", main: false, extra: true });   // 32nd between "+" and "a"
+    SYLLABLES_32.push({ s: "&", main: false, extra: true });   // ⅛-beat between + and a
     SYLLABLES_32.push({ s: "a", main: true });
-    SYLLABLES_32.push({ s: "+", main: false, extra: true });   // 32nd between "a" and next beat
+    SYLLABLES_32.push({ s: "&", main: false, extra: true });   // ⅛-beat between a and next beat
   }
 
   const BEAT_W = 130;
@@ -2524,6 +2838,12 @@ function Lesson11() {
         relaxed that even sixteenths feel slow. Beethoven's <em>Adagio Cantabile</em> and
         Albinoni's <em>Adagio</em> use them this way.
       </p>
+
+      <YouTubeEmbed
+        id="A8dsgqpSrVU"
+        title="Counting ⅛-beats — worked examples"
+        caption="The trick: count the ¼-beats normally, then drop an extra 'and' between each one for the ⅛-beat positions."
+      />
 
       <Insight>
         The trick: keep counting "<strong>1 e + a 2 e + a</strong>" as before, but slip an
@@ -2643,7 +2963,7 @@ function Lesson12() {
   // For 3/4: 6 eighth notes grouped 2+2+2 = 3 beats, each split in 2.
   // For 6/8: 6 eighth notes grouped 3+3 = 2 beats, each split in 3.
   // Same 6 pitches, same total time — different stress pattern.
-  const sixNotes = [PITCH.G4, PITCH.A4, PITCH.B4, PITCH.C5, PITCH.B4, PITCH.A4];
+  const sixNotes = useMemo(() => [PITCH.G4, PITCH.A4, PITCH.B4, PITCH.C5, PITCH.B4, PITCH.A4], []);
 
   // 12 SUBDIVISIONS = 1 bar (so 6 eighth notes are at 0,2,4,6,8,10).
   const SUBDIV = 12;
@@ -2703,16 +3023,18 @@ function Lesson12() {
   return (
     <div className="space-y-6">
       <p className="text-lg leading-relaxed">
-        A time signature is the two stacked numbers at the start of a piece. The <strong>top</strong>
-        tells you how many beats are in a bar; the <strong>bottom</strong> tells you what kind of
-        note <em>counts as a beat</em>.
+        A time signature is the two stacked numbers at the start of a piece. Almost all popular
+        music — pop, rock, hip hop, country, R&amp;B — is in 4/4, so for those genres you barely
+        have to think about it. But classical, jazz, folk and alternative roam more: pieces in 4/2,
+        3/4, 6/8, 12/8 and stranger.
       </p>
 
       <Insight>
-        Two rules: <strong>(1)</strong> the top number is the number of beats per bar.
-        <strong> (2)</strong> the bottom number is what kind of note = 1 beat (4 = quarter,
-        2 = half, 8 = eighth). <strong>Exception:</strong> if the top is 6, 9, or 12, you have
-        2/3/4 beats and each is split into 3 — these are <em>compound</em> time signatures.
+        Two rules: <strong>(1)</strong> the top number tells you how many beats are in a bar.{" "}
+        <strong>(2)</strong> the bottom number tells you what kind of note counts as 1 beat (4 =
+        quarter, 2 = half, 8 = eighth). <strong>Exception:</strong> if the top is 6, 9, or 12, you
+        actually have 2, 3, or 4 beats per bar, and each beat is split into 3 — that's a{" "}
+        <em>compound</em> time signature.
       </Insight>
 
       {/* Demo selector */}
@@ -2883,19 +3205,86 @@ function Lesson12() {
       {demo === "top" && <TopNumberDemo data={TOP_DEMO_DATA} />}
       {demo === "bottom" && <BottomNumberDemo />}
 
+      <h3 className="display-font text-2xl font-black mt-8">Counting ½- or ⅛-notes as beats</h3>
+      <p className="leading-relaxed">
+        Examples where the bottom number is something other than 4 — so you get used to counting a
+        ½-note or an ⅛-note as one beat:
+      </p>
+
+      <YouTubeEmbed
+        id="bczJQSO4zto"
+        title="The bottom number — worked examples"
+        caption="Counting ½-notes as beats (4/2) and ⅛-notes as beats (3/8)."
+      />
+
+      <p className="leading-relaxed text-sm text-stone-700">
+        The arithmetic works just like fractions: 4/2 = four ½-notes per bar, 6/4 = six ¼-notes per
+        bar, 3/8 = three ⅛-notes per bar. Music teachers will tell you not to think of time
+        signatures as fractions, and that's technically true — but they multiply like fractions.
+      </p>
+
+      <h3 className="display-font text-2xl font-black mt-8">Compound time signatures</h3>
+      <p className="leading-relaxed">
+        Look at the left hand of Chopin's <em>Nocturne Op. 9 No. 2</em> (in 12/8): the 12 ⅛-notes
+        are grouped into <strong>4 groups of 3</strong>. So you don't count
+        "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12" — you count{" "}
+        <strong>1</strong>‑2‑3, <strong>2</strong>‑2‑3, <strong>3</strong>‑2‑3, <strong>4</strong>‑2‑3:
+        4 beats, each split in 3.
+      </p>
+
+      <YouTubeEmbed
+        id="08Y0YrB5FQY"
+        title='6/8 in practice — Puccini "O mio babbino caro"'
+        caption="Two beats per bar, each split into 3 ⅛-notes."
+      />
+
+      <ul className="list-disc pl-6 leading-relaxed text-stone-800">
+        <li>Top number is <strong>6</strong> → 2 beats, each split into 3</li>
+        <li>Top number is <strong>9</strong> → 3 beats, each split into 3</li>
+        <li>Top number is <strong>12</strong> → 4 beats, each split into 3</li>
+      </ul>
+
+      <p className="leading-relaxed text-sm text-stone-700">
+        <strong>Note:</strong> this rule applies to multiples of 3 <em>except 3 itself</em>.
+        A bar of 3/4 isn't "1 beat split into 3" — it's just 3 beats (think Beethoven's "Für
+        Elise" or any waltz).
+      </p>
+
       <div className="border border-stone-900 bg-amber-50 p-5" style={{ borderRadius: "2px" }}>
         <p className="font-semibold display-font text-lg mb-2">The 3/4 vs 6/8 distinction</p>
         <p className="text-stone-800 leading-relaxed text-base">
-          Both have six eighth notes per bar. But in <strong>3/4</strong> they group as
-          three pairs (waltz feel: <em>OOM-pah, OOM-pah, OOM-pah</em>). In <strong>6/8</strong>
-          they group as two triplets (lilting feel: <em>ONE-and-a, TWO-and-a</em>). Same notes,
-          different feel — that's why time signatures matter.
+          Both have six ⅛-notes per bar. But in <strong>3/4</strong> they group as three pairs
+          (waltz feel: <em>OOM-pah, OOM-pah, OOM-pah</em>). In <strong>6/8</strong> they group as
+          two triplets (lilting feel: <em>ONE-and-a, TWO-and-a</em>). Compare Brahms's Lullaby (3/4
+          — three beats split in 2) with Puccini's "O mio babbino caro" (6/8 — two beats split in
+          3). Same number of notes, totally different feel.
         </p>
       </div>
 
+      <p className="leading-relaxed">
+        Leonard Bernstein's "America" from <em>West Side Story</em> cleverly switches between the
+        two patterns every couple of bars — a 3/4 bar followed by a 6/8 bar, repeated:
+      </p>
+
+      <YouTubeEmbed
+        id="YhSKk-cvblc"
+        title='Bernstein — "America" (West Side Story)'
+        caption="Listen for the alternation between 3/4 and 6/8 — the very thing that makes the song feel like dancing."
+      />
+
+      <h3 className="display-font text-2xl font-black mt-8">5/4, 7/8, and other unusual signatures</h3>
+      <p className="leading-relaxed">
+        A few pieces use something other than 2, 3 or 4 beats per bar — Dave Brubeck's "Take
+        Five" and the <em>Mission Impossible</em> theme are both in 5/4; Brubeck's "Unsquare
+        Dance" is in 7/8. They're <em>notable</em> precisely because they're so unusual — don't
+        worry about these until you encounter them, which might be never.
+      </p>
+
       <Caption>
-        Almost all popular music sits in 4/4. Classical, folk and jazz roam more — Brahms's
-        Lullaby is in 3/4, Chopin's Nocturne Op. 9 No. 2 is in 12/8, Take Five is in 5/4.
+        That's the end of the rhythm course. From here, the next steps Benedict suggests are:
+        learn pieces from the Intermediate Classical course, or work through{" "}
+        <em>Read Music Fast! Part 1</em> (notes) and <em>Part 2</em> (intervals and key
+        signatures) if you haven't already.
       </Caption>
     </div>
   );
