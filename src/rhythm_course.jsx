@@ -107,7 +107,16 @@ function useAudio() {
 
   const now = useCallback(() => ensureCtx().currentTime, [ensureCtx]);
 
-  return { click, tick, note, now, ensureCtx, cancelScheduled };
+  // Memoise the returned object so its reference is stable across renders.
+  // Without this, every render produces a new wrapper object, which makes
+  // every callback in useTransport (stop, start, etc.) recreate, which makes
+  // any effect that depends on them tear down and re-run on every render —
+  // including the unmount cleanup that calls stop(), which would silently
+  // halt the transport every time React re-renders for any reason.
+  return useMemo(
+    () => ({ click, tick, note, now, ensureCtx, cancelScheduled }),
+    [click, tick, note, now, ensureCtx, cancelScheduled]
+  );
 }
 
 // MIDI -> frequency, using A4 = 440. Most lessons use simple diatonic melodies.
@@ -237,7 +246,12 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
     rafRef.current = requestAnimationFrame(loop);
   }, [audio]);
 
-  useEffect(() => () => stop(), [stop]);
+  // Unmount cleanup. Inlined (rather than calling `stop`) so this effect's
+  // deps stay empty and it only runs on mount/unmount.
+  useEffect(() => () => {
+    stateRef.current.running = false;
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  }, []);
 
   return { playing, position, start, stop, reset, audio };
 }
