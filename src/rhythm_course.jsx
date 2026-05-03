@@ -1792,8 +1792,10 @@ function Lesson6() {
               <path d="M 75 215 L 88 60 L 112 60 L 125 215 Z" fill="#faf6ec" />
               {/* Pivot point */}
               <circle cx={100} cy={70} r={4} fill="#1c1917" />
-              {/* Pendulum arm */}
-              <g transform={`rotate(${angle}, 100, 70)`} style={{ transformOrigin: "100px 70px" }}>
+              {/* Pendulum arm. Translate the pivot to the origin, rotate, then
+                  translate back — robust across browsers regardless of how the
+                  SVG transform attribute is parsed (SVG 1.1 vs CSS Transforms). */}
+              <g transform={`translate(100 70) rotate(${angle}) translate(-100 -70)`}>
                 <line x1={100} y1={70} x2={100} y2={210} stroke="#1c1917" strokeWidth={3} />
                 {/* Sliding weight */}
                 <rect x={92} y={120} width={16} height={10} fill="#1c1917" />
