@@ -1743,14 +1743,11 @@ function Lesson6() {
   const t = useTransport({ bpm, subdivision: 1, totalSubdivisions: Infinity, onTick });
 
   // Pendulum animation. Synced to the transport's continuous `position` so the
-  // arm reaches its furthest swing exactly when the audio click sounds. Each
-  // beat is half a swing cycle: -30° → +30° → -30° over two beats.
-  const angle = t.playing
-    ? (() => {
-        const phase = t.position % 2; // 0..2 over two beats
-        return phase < 1 ? -30 + 60 * phase : 30 - 60 * (phase - 1);
-      })()
-    : -30;
+  // arm reaches its furthest swing exactly when the audio click sounds. One
+  // full swing cycle (-30° → +30° → -30°) takes two beats. Cosine, not a
+  // triangle wave: a real pendulum eases at the extremes and accelerates
+  // through the middle.
+  const angle = t.playing ? -30 * Math.cos(Math.PI * t.position) : -30;
 
   const STEPS = [
     "Make sure you're on top of the notes and fingering.",
