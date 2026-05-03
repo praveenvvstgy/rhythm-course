@@ -18,14 +18,9 @@ function useAudio() {
     if (!ctxRef.current) {
       const AC = window.AudioContext || window.webkitAudioContext;
       ctxRef.current = new AC();
-      console.log("[audio] AudioContext created, state =", ctxRef.current.state);
     }
     if (ctxRef.current.state === "suspended") {
-      console.log("[audio] resuming suspended AudioContext");
-      ctxRef.current.resume().then(
-        () => console.log("[audio] resume() resolved, state =", ctxRef.current?.state),
-        (e) => console.log("[audio] resume() rejected:", e?.message),
-      );
+      ctxRef.current.resume();
     }
     return ctxRef.current;
   }, []);
@@ -187,8 +182,6 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
   }, [bpm, audio]);
 
   const stop = useCallback(() => {
-    console.log("[transport] stop() called. was running=", stateRef.current.running);
-    console.trace("[transport] stop() stack");
     stateRef.current.running = false;
     setPlaying(false);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -214,28 +207,18 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
     s.running = true;
     setPosition(0);
     setPlaying(true);
-    console.log("[transport] start() called. bpm=", bpmRef.current, "subdivision=", subdivisionRef.current, "totalSubs=", totalSubsRef.current, "startTime=", startTime);
 
-    let frameCount = 0;
     const loop = () => {
-      if (!stateRef.current.running) {
-        console.log("[transport] loop bailed: running=false (frame", frameCount, ")");
-        return;
-      }
-      frameCount += 1;
+      if (!stateRef.current.running) return;
       const t = audio.now();
       const subDur = 60 / bpmRef.current / subdivisionRef.current;
       const totalSubs = totalSubsRef.current;
-      if (frameCount === 1 || frameCount % 60 === 0) {
-        console.log("[transport] loop frame", frameCount, "t=", t.toFixed(3), "nextSched=", s.nextSched, "nextSchedTime=", s.nextSchedTime.toFixed(3), "running=", stateRef.current.running);
-      }
 
       // 1. Schedule any subdivisions whose time falls within the lookahead window.
       while (
         s.nextSched < totalSubs &&
         s.nextSchedTime < t + lookAhead
       ) {
-        console.log("[transport] scheduling tick idx=", s.nextSched, "at when=", s.nextSchedTime.toFixed(3), "(now=", t.toFixed(3), ")");
         if (onTickRef.current) onTickRef.current(s.nextSched, s.nextSchedTime, audio);
         s.nextSched += 1;
         s.nextSchedTime += subDur;
@@ -266,7 +249,6 @@ function useTransport({ bpm = 80, subdivision = 1, totalSubdivisions = Infinity,
   // Unmount cleanup. Inlined (rather than calling `stop`) so this effect's
   // deps stay empty and it only runs on mount/unmount.
   useEffect(() => () => {
-    console.log("[transport] unmount cleanup running=", stateRef.current.running);
     stateRef.current.running = false;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }, []);
